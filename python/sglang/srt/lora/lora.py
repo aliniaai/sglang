@@ -267,10 +267,16 @@ class LoRAAdapter(nn.Module):
                 # else: no-op as LoRA B weight is already stacked.
 
     def _rename_expert_w_to_proj(self, weights: Dict[str, torch.Tensor]):
-        """Rename w1 -> gate_proj, w3 -> up_proj, w2 -> down_proj so that
-        normalize_gate_up_proj can stack them into gate_up_proj."""
+        """Rename MoE-expert w1 -> gate_proj, w3 -> up_proj, w2 -> down_proj so
+        that normalize_gate_up_proj can stack them into gate_up_proj.
+
+        Guarded to expert weights only (routed and shared): dense MLPs (e.g.
+        LFM2 feed_forward.w1/w2/w3) have no "experts" in their key, keep their
+        names, and are served as three independent LoRA modules."""
         renames = {}
         for name in list(weights.keys()):
+            if "experts" not in name:
+                continue
             new_name = name
             if ".w1." in name:
                 new_name = name.replace(".w1.", ".gate_proj.")
