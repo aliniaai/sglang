@@ -52,6 +52,35 @@ from sglang.srt.utils import add_prefix, make_layers, set_weight_attrs
 logger = logging.getLogger(__name__)
 
 
+def lfm2_head_dim(config: Lfm2Config) -> int:
+    """Attention head dim, falling back to hidden // num_heads when unset.
+
+    Shared by Lfm2Attention and Lfm2ForCausalLM.get_hidden_dim so LoRA
+    qkv_proj/out_proj buffer dims match the real attention shapes.
+    """
+    return getattr(config, "head_dim", None) or (
+        config.hidden_size // config.num_attention_heads
+    )
+
+
+def lfm2_mlp_intermediate_size(config: Lfm2Config) -> int:
+    """The actual w1/w3/w2 intermediate dim, after block_auto_adjust_ff_dim.
+
+    Shared by Lfm2MLP.__init__ and Lfm2ForCausalLM.get_hidden_dim so LoRA
+    buffer shapes for w1/w2/w3 can't drift from the real linear shapes.
+    """
+    intermediate_size = config.intermediate_size
+    if config.block_auto_adjust_ff_dim:
+        intermediate_size = int(2 * intermediate_size / 3)
+        if config.block_ffn_dim_multiplier is not None:
+            intermediate_size = int(config.block_ffn_dim_multiplier * intermediate_size)
+            intermediate_size = config.block_multiple_of * (
+                (intermediate_size + config.block_multiple_of - 1)
+                // config.block_multiple_of
+            )
+    return intermediate_size
+
+
 class Lfm2MLP(nn.Module):
     """MLP with SwiGLU activation."""
 
@@ -62,18 +91,7 @@ class Lfm2MLP(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        intermediate_size = config.intermediate_size
-
-        if config.block_auto_adjust_ff_dim:
-            intermediate_size = int(2 * intermediate_size / 3)
-            if config.block_ffn_dim_multiplier is not None:
-                intermediate_size = int(
-                    config.block_ffn_dim_multiplier * intermediate_size
-                )
-                intermediate_size = config.block_multiple_of * (
-                    (intermediate_size + config.block_multiple_of - 1)
-                    // config.block_multiple_of
-                )
+        intermediate_size = lfm2_mlp_intermediate_size(config)
 
         self.w1 = ColumnParallelLinear(
             config.hidden_size,
@@ -119,9 +137,7 @@ class Lfm2Attention(nn.Module):
         self.hidden_size = config.hidden_size
         self.total_num_heads = config.num_attention_heads
         self.total_num_kv_heads = config.num_key_value_heads
-        self.head_dim = getattr(config, "head_dim", None) or (
-            self.hidden_size // self.total_num_heads
-        )
+        self.head_dim = lfm2_head_dim(config)
         self.scaling = self.head_dim**-0.5
 
         rope_parameters = getattr(config, "rope_parameters", None)
@@ -619,6 +635,45 @@ class Lfm2ForCausalLM(nn.Module):
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
+
+    def get_hidden_dim(self, module_name: str, layer_idx: int) -> Tuple[int, int]:
+        """(input_dim, output_dim) per LoRA target module, per hybrid layer type.
+
+        layer_types[layer_idx] selects the attention (qkv_proj/out_proj) vs conv
+        (out_proj) shape; feed_forward (w1/w2/w3) exists in every layer. Without
+        this hook the LoRA memory pool falls back to a llama-name table that
+        doesn't know LFM2's out_proj/w1/w2/w3 and raises at init.
+
+        Serve these via an explicit --lora-target-modules / adapter
+        target_modules list. The ShortConv `in_proj` is intentionally not
+        handled: it is a 3-way (B/C/x) merge, but the LoRA stacking convention
+        assumes get_stacked_multiply("in_proj")==2, so it cannot be served
+        correctly yet — which also means "all-linear" is unsupported for LFM2.
+        """
+        config = self.config
+        hidden = config.hidden_size
+        head_dim = lfm2_head_dim(config)
+        is_attention = config.layer_types[layer_idx] == "full_attention"
+        if module_name == "qkv_proj":
+            return hidden, head_dim * (
+                config.num_attention_heads + config.num_key_value_heads * 2
+            )
+        elif module_name == "out_proj":
+            # Attention out_proj: heads*head_dim -> hidden. Conv out_proj is
+            # hidden -> hidden; its buffer slot zero-fills when untrained.
+            return (
+                (head_dim * config.num_attention_heads, hidden)
+                if is_attention
+                else (hidden, hidden)
+            )
+        elif module_name in ("w1", "w3"):
+            return hidden, lfm2_mlp_intermediate_size(config)
+        elif module_name == "w2":
+            return lfm2_mlp_intermediate_size(config), hidden
+        else:
+            raise NotImplementedError(
+                f"get_hidden_dim not implemented for {module_name}"
+            )
 
     @torch.no_grad()
     def forward(
